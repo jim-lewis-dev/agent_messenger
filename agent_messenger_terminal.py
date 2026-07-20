@@ -7,12 +7,18 @@ import queue
 import threading
 from datetime import datetime
 
-from agent_messenger import AgentMessenger, format_message_line, one_line
+from agent_messenger import (
+    AgentMessenger,
+    AgentMessengerError,
+    NoPendingRequest,
+    format_message_line,
+    one_line,
+)
 from nats_transport import NatsTransport
 
 
 class AgentTerminal:
-    """Live activity pane, permanent prompt, and permanent one-line status."""
+    """Live activity pane, permanent prompt, and one-line status."""
 
     def __init__(self, name: str, server: str, prefix: str):
         self.name = name
@@ -22,7 +28,6 @@ class AgentTerminal:
         self.lines: list[str] = []
         self.scroll_offset = 0
         self.page_size = 1
-        self.pending_questions: dict[str, str] = {}
         self.input: list[str] = []
         self.cursor = 0
         self.history: list[str] = []
@@ -42,8 +47,8 @@ class AgentTerminal:
         self.namespace = {
             "send": self.agent.send,
             "request": self.agent.request,
-            "reply": self.agent.reply,
-            "pending": self.agent.pending,
+            "reply": self.reply,
+            "pending": self.pending,
         }
 
     def post(self, event: dict) -> None:
@@ -51,6 +56,37 @@ class AgentTerminal:
 
     def close(self) -> None:
         self.agent.close()
+
+    def reply(self, request_reference: str, message: str) -> None:
+        """Reply using a full request ID or a unique displayed prefix."""
+        request_id = self._resolve_request_id(request_reference)
+        self.agent.reply(request_id, message)
+
+    def pending(self) -> dict[str, dict]:
+        """Return pending requests keyed by their displayed short IDs."""
+        return {
+            item["request_id"][:8]: {
+                "peer": item["peer"],
+                "text": item["text"],
+                "remaining": round(item["remaining"], 3),
+            }
+            for item in self.agent.pending()
+        }
+
+    def _resolve_request_id(self, reference: str) -> str:
+        if not isinstance(reference, str) or not reference:
+            raise AgentMessengerError("request reference must be a nonempty string")
+
+        request_ids = [item["request_id"] for item in self.agent.pending()]
+        if reference in request_ids:
+            return reference
+
+        matches = [request_id for request_id in request_ids if request_id.startswith(reference)]
+        if not matches:
+            raise NoPendingRequest(f"no live request matches {reference!r}")
+        if len(matches) > 1:
+            raise AgentMessengerError(f"request prefix {reference!r} is ambiguous")
+        return matches[0]
 
     def run(self) -> None:
         curses.wrapper(self._run)
@@ -79,18 +115,12 @@ class AgentTerminal:
                 return
 
             kind = event.get("type")
-            if kind in {"error", "flow_error", "protocol_error"}:
+            if kind in {"error", "protocol_error"}:
                 self.status = "ERROR — " + one_line(event.get("text", "unknown error"))
                 continue
             if kind == "status":
                 self.status = one_line(event.get("text", "READY"))
                 continue
-            if kind == "in_request":
-                self.pending_questions[event.get("peer", "unknown")] = one_line(
-                    event.get("text", "")
-                )
-            elif kind == "out_reply":
-                self.pending_questions.pop(event.get("peer", "unknown"), None)
 
             line = self._format_event(event)
             if line:
@@ -103,9 +133,13 @@ class AgentTerminal:
         kind = event.get("type")
         peer = event.get("peer", "")
         text = one_line(event.get("text", ""))
+        request_id = event.get("request_id")
+        if isinstance(request_id, str):
+            text = f"[{request_id[:8]}] {text}"
 
         if kind == "ready":
             return f"{timestamp}  READY    {self.name} @ {self.server}"
+
         traffic = {
             "out_message": ("MESSAGE", self.name, peer),
             "in_message": ("MESSAGE", peer, self.name),
@@ -136,30 +170,25 @@ class AgentTerminal:
             screen.refresh()
             return
 
-        pending_senders = self.agent.pending_senders()
-        active = set(pending_senders)
-        for peer in tuple(self.pending_questions):
-            if peer not in active:
-                del self.pending_questions[peer]
-
-        pending_count = len(pending_senders)
+        pending = self.agent.pending()
+        pending_count = len(pending)
         header = f" {self.name} | pending: {pending_count or 'none'} "
         self._add(screen, 0, 0, header.ljust(width - 1), curses.A_REVERSE)
 
         pending_rows = min(pending_count, max(0, height - 6))
-        for row, peer in enumerate(pending_senders[:pending_rows], 1):
-            question = self.pending_questions.get(peer, "")
-            self._add(screen, row, 0, f"   {peer}: {question}"[: width - 1], curses.A_BOLD)
+        for row, item in enumerate(pending[:pending_rows], 1):
+            request_id = item["request_id"][:8]
+            line = f"   {request_id}  {item['peer']}: {one_line(item['text'])}"
+            self._add(screen, row, 0, line[: width - 1], curses.A_BOLD)
 
         activity_start = 1 + pending_rows
         activity_rows = height - activity_start - 3
         self.page_size = max(1, activity_rows)
-        lines = self.lines
-        max_offset = max(0, len(lines) - activity_rows)
+        max_offset = max(0, len(self.lines) - activity_rows)
         self.scroll_offset = min(self.scroll_offset, max_offset)
-        end = len(lines) - self.scroll_offset
+        end = len(self.lines) - self.scroll_offset
         start = max(0, end - activity_rows)
-        for row, line in enumerate(lines[start:end], activity_start):
+        for row, line in enumerate(self.lines[start:end], activity_start):
             self._add(screen, row, 0, line[: width - 1])
 
         self._add(screen, height - 3, 0, "-" * (width - 1), curses.A_DIM)
@@ -221,10 +250,7 @@ class AgentTerminal:
             return
         if key == curses.KEY_PPAGE:
             max_offset = max(0, len(self.lines) - self.page_size)
-            self.scroll_offset = min(
-                max_offset,
-                self.scroll_offset + self.page_size,
-            )
+            self.scroll_offset = min(max_offset, self.scroll_offset + self.page_size)
             return
         if key == curses.KEY_NPAGE:
             self.scroll_offset = max(0, self.scroll_offset - self.page_size)

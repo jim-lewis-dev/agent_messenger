@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transport-independent messenger for named agents."""
+"""Transport-independent messaging for named agents."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ import string
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Protocol
 
 VALID_NAME_CHARACTERS = set(string.ascii_letters + string.digits + "_-")
+_WAKE = object()
 
 
 class AgentMessengerError(Exception):
@@ -35,6 +37,20 @@ class Transport(Protocol):
     def subscribe(self, topic: str, callback: Callable[[bytes], None]) -> None: ...
     def publish(self, topic: str, data: bytes) -> None: ...
     def close(self) -> None: ...
+
+
+@dataclass
+class _WaitingRequest:
+    recipient: str
+    done: threading.Event
+    result: list[str]
+
+
+@dataclass
+class _PendingRequest:
+    sender: str
+    deadline: float
+    text: str
 
 
 def one_line(value: object) -> str:
@@ -76,14 +92,13 @@ def _timeout(value: float) -> float:
 
 
 class AgentMessenger:
-    """Portable agent send/request/reply logic over any Transport implementation."""
+    """Portable agent send/request/reply behavior over any Transport."""
 
     def __init__(
         self,
         name: str,
         transport: Transport,
         prefix: str = "agents",
-        publish_flow: bool = True,
         on_event: Callable[[dict], None] | None = None,
     ):
         self.name = _name(name)
@@ -91,23 +106,29 @@ class AgentMessenger:
         self.prefix = prefix.strip(".")
         if not self.prefix:
             raise AgentMessengerError("prefix must not be empty")
-        self.publish_flow = publish_flow
+
         self._listeners: list[Callable[[dict], None]] = []
         if on_event is not None:
             if not callable(on_event):
                 raise AgentMessengerError("listener must be callable")
             self._listeners.append(on_event)
+
         self._listeners_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        self._waiting: dict[str, tuple[threading.Event, list[str]]] = {}
-        self._pending: dict[str, tuple[str, float, str]] = {}
-        self._inbox: queue.Queue[bytes | None] = queue.Queue()
+        self._waiting: dict[str, _WaitingRequest] = {}
+        self._pending: dict[str, _PendingRequest] = {}
+        self._inbox: queue.Queue[bytes | object | None] = queue.Queue()
         self._closed = False
 
-        self.transport.subscribe(self._topic(self.name), self._inbox.put)
+        try:
+            self.transport.subscribe(self._topic(self.name), self._inbox.put)
+        except BaseException:
+            self.transport.close()
+            raise
+
         self._worker = threading.Thread(
             target=self._run,
-            name=f"agent_messenger-{self.name}",
+            name=f"agent-messenger-{self.name}",
             daemon=True,
         )
         self._worker.start()
@@ -132,76 +153,109 @@ class AgentMessenger:
 
     def request(self, recipient: str, message: str, timeout: float = 10) -> str:
         recipient, message, timeout = _name(recipient), _text(message), _timeout(timeout)
+        deadline = time.monotonic() + timeout
         request_id = uuid.uuid4().hex
-        done = threading.Event()
-        result: list[str] = []
-        with self._state_lock:
-            self._waiting[request_id] = (done, result)
+        waiting = _WaitingRequest(recipient, threading.Event(), [])
 
-        envelope = self._envelope(
-            "request",
-            recipient,
-            message,
+        with self._state_lock:
+            self._waiting[request_id] = waiting
+
+        self._emit(
+            "out_request",
+            peer=recipient,
+            text=message,
+            timeout=timeout,
             request_id=request_id,
-            expires_at=time.time() + timeout,
         )
-        self._emit("out_request", peer=recipient, text=message, timeout=timeout)
         try:
-            self._publish(envelope)
+            self._publish(
+                self._envelope(
+                    "request",
+                    recipient,
+                    message,
+                    request_id=request_id,
+                    timeout=timeout,
+                )
+            )
         except Exception:
             with self._state_lock:
                 self._waiting.pop(request_id, None)
             raise
 
-        if not done.wait(timeout):
+        remaining = max(0.0, deadline - time.monotonic())
+        if not waiting.done.wait(remaining):
             with self._state_lock:
-                self._waiting.pop(request_id, None)
-            self._emit("request_timeout", peer=recipient, text=message, timeout=timeout)
+                removed = self._waiting.pop(request_id, None)
+            if removed is None and waiting.done.is_set():
+                return waiting.result[0]
+            self._emit(
+                "request_timeout",
+                peer=recipient,
+                text=message,
+                timeout=timeout,
+                request_id=request_id,
+            )
             raise RequestTimeout(
                 f"NO REPLY — {recipient!r} did not reply within {timeout:g}s"
             )
-        return result[0]
 
-    def reply(self, recipient: str, message: str) -> None:
-        recipient, message = _name(recipient), _text(message)
+        return waiting.result[0]
+
+    def reply(self, request_id: str, message: str) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            raise AgentMessengerError("request_id must be a nonempty string")
+        message = _text(message)
+
         with self._state_lock:
-            pending = self._pending.pop(recipient, None)
+            pending = self._pending.pop(request_id, None)
+
         if pending is None:
             raise NoPendingRequest(
-                f"NOTHING TO REPLY TO — no live request from {recipient!r}"
+                f"NOTHING TO REPLY TO — no live request {request_id!r}"
             )
 
-        request_id, expires_at, request_text = pending
-        if time.time() >= expires_at:
-            raise RequestExpired(f"TOO LATE — {recipient!r}'s request expired")
+        if time.monotonic() >= pending.deadline:
+            raise RequestExpired(
+                f"TOO LATE — request {request_id[:8]!r} from {pending.sender!r} expired"
+            )
 
-        self._emit("out_reply", peer=recipient, text=message)
+        self._emit(
+            "out_reply",
+            peer=pending.sender,
+            text=message,
+            request_id=request_id,
+        )
         try:
             self._publish(
-                self._envelope("reply", recipient, message, request_id=request_id)
+                self._envelope(
+                    "reply",
+                    pending.sender,
+                    message,
+                    request_id=request_id,
+                )
             )
         except Exception:
             with self._state_lock:
-                if recipient not in self._pending and time.time() < expires_at:
-                    self._pending[recipient] = pending
+                if request_id not in self._pending and time.monotonic() < pending.deadline:
+                    self._pending[request_id] = pending
+                    self._inbox.put(_WAKE)
             raise
 
-    def pending_senders(self) -> tuple[str, ...]:
-        now = time.time()
+    def pending(self) -> tuple[dict, ...]:
+        """Return snapshots of all currently live incoming requests."""
+        now = time.monotonic()
         with self._state_lock:
-            expired = [peer for peer, (_, end, _) in self._pending.items() if now >= end]
-            for peer in expired:
-                del self._pending[peer]
-            return tuple(sorted(self._pending))
-
-    def pending(self) -> dict[str, str]:
-        """Return newest live request text keyed by sender name."""
-        now = time.time()
-        with self._state_lock:
-            expired = [peer for peer, (_, end, _) in self._pending.items() if now >= end]
-            for peer in expired:
-                del self._pending[peer]
-            return {peer: self._pending[peer][2] for peer in sorted(self._pending)}
+            requests = [
+                {
+                    "request_id": request_id,
+                    "peer": pending.sender,
+                    "text": pending.text,
+                    "remaining": max(0.0, pending.deadline - now),
+                }
+                for request_id, pending in self._pending.items()
+                if pending.deadline > now
+            ]
+        return tuple(sorted(requests, key=lambda item: (item["peer"], item["request_id"])))
 
     def close(self) -> None:
         if self._closed:
@@ -216,19 +270,12 @@ class AgentMessenger:
     def _topic(self, agent: str) -> str:
         return f"{self.prefix}.inbox.{agent}"
 
-    @property
-    def flow_topic(self) -> str:
-        return f"{self.prefix}.flow"
-
     def _envelope(self, kind: str, recipient: str, text: str, **extra: object) -> dict:
         return {
-            "version": 1,
-            "id": uuid.uuid4().hex,
             "kind": kind,
             "sender": self.name,
             "recipient": recipient,
             "text": text,
-            "sent_at": time.time(),
             **extra,
         }
 
@@ -237,25 +284,49 @@ class AgentMessenger:
             raise AgentMessengerError("agent messenger is closed")
         data = json.dumps(envelope, separators=(",", ":")).encode()
         self.transport.publish(self._topic(envelope["recipient"]), data)
-        if self.publish_flow:
-            try:
-                self.transport.publish(self.flow_topic, data)
-            except Exception as error:
-                self._emit("flow_error", text=one_line(error))
 
     def _run(self) -> None:
         while True:
-            data = self._inbox.get()
+            self._expire_pending()
+            wait = self._next_expiration_wait()
+            try:
+                data = self._inbox.get(timeout=wait)
+            except queue.Empty:
+                continue
             if data is None:
                 return
+            if data is _WAKE:
+                continue
             try:
                 self._receive(json.loads(data.decode()))
             except Exception as error:
                 self._emit("protocol_error", text=one_line(error))
 
+    def _next_expiration_wait(self) -> float | None:
+        now = time.monotonic()
+        with self._state_lock:
+            if not self._pending:
+                return None
+            nearest = min(request.deadline for request in self._pending.values())
+        return max(0.0, nearest - now)
+
+    def _expire_pending(self) -> None:
+        now = time.monotonic()
+        expired: list[tuple[str, _PendingRequest]] = []
+        with self._state_lock:
+            for request_id, pending in tuple(self._pending.items()):
+                if now >= pending.deadline:
+                    expired.append((request_id, self._pending.pop(request_id)))
+        for request_id, pending in expired:
+            self._emit(
+                "expired_request",
+                peer=pending.sender,
+                text=pending.text,
+                request_id=request_id,
+            )
+
     def _receive(self, envelope: dict) -> None:
-        if envelope.get("version") != 1 or envelope.get("recipient") != self.name:
-            raise AgentMessengerError("invalid envelope")
+
         sender = _name(envelope.get("sender"))
         text = _text(envelope.get("text"))
         kind = envelope.get("kind")
@@ -266,29 +337,63 @@ class AgentMessenger:
 
         if kind == "request":
             request_id = envelope.get("request_id")
-            expires_at = envelope.get("expires_at")
-            if not isinstance(request_id, str) or not isinstance(expires_at, (int, float)):
-                raise AgentMessengerError("invalid request envelope")
-            if time.time() >= expires_at:
-                self._emit("expired_request", peer=sender, text=text)
-                return
+            timeout = envelope.get("timeout")
+            if not isinstance(request_id, str) or not request_id:
+                raise AgentMessengerError("invalid request_id")
+            timeout = _timeout(timeout)
+            pending = _PendingRequest(sender, time.monotonic() + timeout, text)
             with self._state_lock:
-                replaced = sender in self._pending
-                self._pending[sender] = (request_id, float(expires_at), text)
-            self._emit("in_request", peer=sender, text=text, replaced=replaced)
+                if request_id in self._pending:
+                    raise AgentMessengerError("duplicate request_id")
+                self._pending[request_id] = pending
+            self._emit(
+                "in_request",
+                peer=sender,
+                text=text,
+                timeout=timeout,
+                request_id=request_id,
+            )
             return
 
         if kind == "reply":
             request_id = envelope.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise AgentMessengerError("invalid request_id")
+
             with self._state_lock:
-                waiting = self._waiting.pop(request_id, None)
-            if waiting is None:
-                self._emit("late_reply", peer=sender, text=text)
+                waiting = self._waiting.get(request_id)
+                if waiting is None:
+                    late = True
+                    wrong_sender = False
+                elif sender != waiting.recipient:
+                    late = False
+                    wrong_sender = True
+                else:
+                    late = False
+                    wrong_sender = False
+                    waiting.result.append(text)
+                    waiting.done.set()
+                    del self._waiting[request_id]
+
+            if late:
+                self._emit(
+                    "late_reply",
+                    peer=sender,
+                    text=text,
+                    request_id=request_id,
+                )
                 return
-            done, result = waiting
-            result.append(text)
-            self._emit("in_reply", peer=sender, text=text)
-            done.set()
+            if wrong_sender:
+                raise AgentMessengerError(
+                    f"reply for {request_id[:8]!r} came from unexpected agent {sender!r}"
+                )
+
+            self._emit(
+                "in_reply",
+                peer=sender,
+                text=text,
+                request_id=request_id,
+            )
             return
 
         raise AgentMessengerError(f"unknown envelope kind {kind!r}")
