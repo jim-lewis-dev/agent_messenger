@@ -34,7 +34,7 @@ class AgentTerminal:
         self.history_pos = 0
         self.status = (
             "READY — PgUp/PgDn scroll | End latest | Up/Down history | "
-            "Ctrl-L clear | Ctrl-D quit"
+            "Ctrl-L clear | Ctrl-C quit"
         )
         self.running = True
         self.transport = NatsTransport(server)
@@ -231,13 +231,8 @@ class AgentTerminal:
         if key in ("\n", "\r", curses.KEY_ENTER):
             self._submit()
             return
-        if key in ("\x04", "\x11"):
-            self.running = False
-            return
         if key == "\x03":
-            self.input.clear()
-            self.cursor = 0
-            self.status = "INPUT CLEARED"
+            self.running = False
             return
         if key == "\x0c":
             self.lines.clear()

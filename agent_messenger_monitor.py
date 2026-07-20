@@ -24,7 +24,7 @@ class FlowTerminal:
         self.pending: dict[str, tuple[str, str, float, str]] = {}
         self.status = (
             "LIVE — PgUp/PgDn scroll | End latest | Ctrl-L clear | "
-            "Ctrl-D or Q quit"
+            "Ctrl-C or Q quit"
         )
         self.running = True
         self.transport = NatsTransport(server)
@@ -52,7 +52,7 @@ class FlowTerminal:
                 key = screen.get_wch()
             except curses.error:
                 continue
-            if key in ("q", "Q", "\x04", "\x11"):
+            if key in ("q", "Q", "\x03"):
                 self.running = False
             elif key == "\x0c":
                 self.lines.clear()
@@ -93,7 +93,7 @@ class FlowTerminal:
                 )
                 self.status = (
                     f"LIVE — {len(self.lines)} events | PgUp/PgDn scroll | "
-                    "End latest | Ctrl-L clear | Ctrl-D or Q quit"
+                    "End latest | Ctrl-L clear | Ctrl-C or Q quit"
                 )
             except Exception as error:
                 self.status = "ERROR — " + one_line(error)
