@@ -47,7 +47,7 @@ class AgentTerminal:
         self.namespace = {
             "send": self.agent.send,
             "request": self.agent.request,
-            "reply": self.reply,
+            "respond": self.respond,
             "pending": self.pending,
         }
 
@@ -57,17 +57,17 @@ class AgentTerminal:
     def close(self) -> None:
         self.agent.close()
 
-    def reply(self, request_reference: str, message: str) -> None:
-        """Reply using a full request ID or a unique displayed prefix."""
+    def respond(self, request_reference: str, payload: str) -> None:
+        """Respond using a full request ID or a unique displayed prefix."""
         request_id = self._resolve_request_id(request_reference)
-        self.agent.reply(request_id, message)
+        self.agent.respond(request_id, payload)
 
     def pending(self) -> dict[str, dict]:
         """Return pending requests keyed by their displayed short IDs."""
         return {
             item["request_id"][:8]: {
                 "peer": item["peer"],
-                "text": item["text"],
+                "payload": item["payload"],
                 "remaining": round(item["remaining"], 3),
             }
             for item in self.agent.pending()
@@ -114,12 +114,14 @@ class AgentTerminal:
             except queue.Empty:
                 return
 
-            kind = event.get("type")
-            if kind in {"error", "protocol_error"}:
-                self.status = "ERROR — " + one_line(event.get("text", "unknown error"))
+            event_type = event.get("type")
+            if event_type in {"error", "protocol_error"}:
+                self.status = "ERROR — " + one_line(
+                    event.get("payload", "unknown error")
+                )
                 continue
-            if kind == "status":
-                self.status = one_line(event.get("text", "READY"))
+            if event_type == "status":
+                self.status = one_line(event.get("payload", "READY"))
                 continue
 
             line = self._format_event(event)
@@ -130,35 +132,35 @@ class AgentTerminal:
 
     def _format_event(self, event: dict) -> str | None:
         timestamp = event.get("time", datetime.now().strftime("%H:%M:%S"))
-        kind = event.get("type")
+        event_type = event.get("type")
         peer = event.get("peer", "")
-        text = one_line(event.get("text", ""))
+        payload = one_line(event.get("payload", ""))
         request_id = event.get("request_id")
         if isinstance(request_id, str):
-            text = f"[{request_id[:8]}] {text}"
+            payload = f"[{request_id[:8]}] {payload}"
 
-        if kind == "ready":
-            return f"{timestamp}  READY    {self.name} @ {self.server}"
+        if event_type == "ready":
+            return f"{timestamp}  READY     {self.name} @ {self.server}"
 
         traffic = {
             "out_message": ("MESSAGE", self.name, peer),
             "in_message": ("MESSAGE", peer, self.name),
             "out_request": ("REQUEST", self.name, peer),
             "in_request": ("REQUEST", peer, self.name),
-            "out_reply": ("REPLY", self.name, peer),
-            "in_reply": ("REPLY", peer, self.name),
+            "out_response": ("RESPONSE", self.name, peer),
+            "in_response": ("RESPONSE", peer, self.name),
         }
-        if kind in traffic:
-            label, sender, recipient = traffic[kind]
-            return format_message_line(timestamp, label, sender, recipient, text)
-        if kind == "request_timeout":
-            return f"{timestamp}  TIMEOUT  {peer} ({event['timeout']:g}s): {text}"
-        if kind == "expired_request":
-            return f"{timestamp}  EXPIRED  request from {peer}: {text}"
-        if kind == "late_reply":
-            return f"{timestamp}  LATE RPL {peer}: {text}"
-        if kind == "result":
-            return f"{timestamp}  RESULT   {text}"
+        if event_type in traffic:
+            label, sender, recipient = traffic[event_type]
+            return format_message_line(timestamp, label, sender, recipient, payload)
+        if event_type == "request_timeout":
+            return f"{timestamp}  TIMEOUT   {peer} ({event['timeout']:g}s): {payload}"
+        if event_type == "expired_request":
+            return f"{timestamp}  EXPIRED   request from {peer}: {payload}"
+        if event_type == "late_response":
+            return f"{timestamp}  LATE RESP {peer}: {payload}"
+        if event_type == "result":
+            return f"{timestamp}  RESULT    {payload}"
         return None
 
     def _draw(self, screen) -> None:
@@ -178,7 +180,7 @@ class AgentTerminal:
         pending_rows = min(pending_count, max(0, height - 6))
         for row, item in enumerate(pending[:pending_rows], 1):
             request_id = item["request_id"][:8]
-            line = f"   {request_id}  {item['peer']}: {one_line(item['text'])}"
+            line = f"   {request_id}  {item['peer']}: {one_line(item['payload'])}"
             self._add(screen, row, 0, line[: width - 1], curses.A_BOLD)
 
         activity_start = 1 + pending_rows
@@ -309,16 +311,16 @@ class AgentTerminal:
         try:
             result = eval(compile(command, "<agent-terminal>", "eval"), self.namespace)
             if result is not None:
-                self.post({"type": "result", "text": repr(result)})
-            self.post({"type": "status", "text": "READY"})
+                self.post({"type": "result", "payload": repr(result)})
+            self.post({"type": "status", "payload": "READY"})
         except SyntaxError as error:
-            self.post({"type": "error", "text": f"SYNTAX — {one_line(error.msg)}"})
+            self.post({"type": "error", "payload": f"SYNTAX — {one_line(error.msg)}"})
         except NameError as error:
-            self.post({"type": "error", "text": f"UNKNOWN COMMAND — {one_line(error)}"})
+            self.post({"type": "error", "payload": f"UNKNOWN COMMAND — {one_line(error)}"})
         except TypeError as error:
-            self.post({"type": "error", "text": f"BAD CALL — {one_line(error)}"})
+            self.post({"type": "error", "payload": f"BAD CALL — {one_line(error)}"})
         except BaseException as error:
-            self.post({"type": "error", "text": one_line(error)})
+            self.post({"type": "error", "payload": one_line(error)})
 
 
 def main() -> int:
@@ -332,6 +334,8 @@ def main() -> int:
     try:
         terminal = AgentTerminal(args.agent_name, args.server, args.prefix)
         terminal.run()
+    except KeyboardInterrupt:
+        return 0
     except Exception as error:
         print(f"ERROR — {one_line(error)}")
         return 1
