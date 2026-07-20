@@ -4,6 +4,7 @@
 import argparse
 import curses
 import json
+import math
 import queue
 import time
 from datetime import datetime
@@ -75,19 +76,19 @@ class FlowTerminal:
                 envelope = json.loads(data.decode())
                 self._update_pending(envelope)
                 timestamp = datetime.now().strftime("%H:%M:%S")
-                text = one_line(envelope.get("text", ""))
+                payload = one_line(envelope.get("payload", ""))
                 request_id = envelope.get("request_id")
                 if isinstance(request_id, str):
-                    text = f"[{request_id[:8]}] {text}"
+                    payload = f"[{request_id[:8]}] {payload}"
                 if self.scroll_offset:
                     self.scroll_offset += 1
                 self.lines.append(
                     format_message_line(
                         timestamp,
-                        envelope["kind"],
+                        envelope["type"],
                         envelope["sender"],
                         envelope["recipient"],
-                        text,
+                        payload,
                     )
                 )
                 self.status = (
@@ -100,21 +101,26 @@ class FlowTerminal:
     def _update_pending(self, envelope: dict) -> None:
         sender = envelope.get("sender")
         recipient = envelope.get("recipient")
-        kind = envelope.get("kind")
+        message_type = envelope.get("type")
         request_id = envelope.get("request_id")
         if not all(isinstance(value, str) for value in (sender, recipient, request_id)):
             return
 
-        if kind == "request":
+        if message_type == "request":
             timeout = envelope.get("timeout")
-            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+            if (
+                isinstance(timeout, (int, float))
+                and not isinstance(timeout, bool)
+                and math.isfinite(float(timeout))
+                and timeout > 0
+            ):
                 self.pending[request_id] = (
                     sender,
                     recipient,
                     time.monotonic() + float(timeout),
-                    one_line(envelope.get("text", "")),
+                    one_line(envelope.get("payload", "")),
                 )
-        elif kind == "reply":
+        elif message_type == "response":
             current = self.pending.get(request_id)
             if current and current[0] == recipient and current[1] == sender:
                 del self.pending[request_id]
@@ -141,10 +147,10 @@ class FlowTerminal:
         self._add(screen, 0, 0, header.ljust(width - 1), curses.A_REVERSE)
 
         pending_rows = min(len(pending_items), max(0, height - 4))
-        for row, (request_id, (sender, recipient, _, question)) in enumerate(
+        for row, (request_id, (sender, recipient, _, payload)) in enumerate(
             pending_items[:pending_rows], 1
         ):
-            line = f"   {request_id[:8]}  {recipient} <- {sender}: {question}"
+            line = f"   {request_id[:8]}  {recipient} <- {sender}: {payload}"
             self._add(screen, row, 0, line[: width - 1], curses.A_BOLD)
 
         activity_start = 1 + pending_rows
@@ -179,6 +185,8 @@ def main() -> int:
     try:
         terminal = FlowTerminal(args.server, args.prefix)
         terminal.run()
+    except KeyboardInterrupt:
+        return 0
     except Exception as error:
         print(f"ERROR — {one_line(error)}")
         return 1
