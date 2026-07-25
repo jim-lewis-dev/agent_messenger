@@ -72,8 +72,8 @@ def format_message_line(
 ) -> str:
     """Format message, request, and response traffic uniformly."""
     return (
-        f"{timestamp}  {message_type.upper():<8}  {sender[:8]:<8}  ->  "
-        f"{recipient[:8]:<8}  :  {one_line(payload)}"
+        f"{timestamp}  {message_type.upper():<8}  {sender[:16]:<16}  ->  "
+        f"{recipient[:16]:<16}  :  {one_line(payload)}"
     )
 
 
@@ -307,7 +307,14 @@ class AgentMessenger:
             ]
 
         return tuple(
-            sorted(requests, key=lambda item: (item["peer"], item["request_id"]))
+            sorted(
+                requests,
+                key=lambda item: (
+                    item["remaining"],
+                    item["peer"],
+                    item["request_id"],
+                ),
+            )
         )
 
     def close(self) -> None:
