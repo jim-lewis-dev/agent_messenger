@@ -3,6 +3,7 @@
 
 import argparse
 import curses
+import math
 import queue
 import threading
 from datetime import datetime
@@ -33,7 +34,7 @@ class AgentTerminal:
         self.history: list[str] = []
         self.history_pos = 0
         self.status = (
-            "READY — PgUp/PgDn scroll | End latest | Up/Down history | "
+            "READY — PgUp/PgDn scroll | Home/End oldest/newest | Up/Down history | "
             "Ctrl-L clear | Ctrl-C quit"
         )
         self.running = True
@@ -180,7 +181,12 @@ class AgentTerminal:
         pending_rows = min(pending_count, max(0, height - 6))
         for row, item in enumerate(pending[:pending_rows], 1):
             request_id = item["request_id"][:8]
-            line = f"   {request_id}  {item['peer']}: {one_line(item['payload'])}"
+            seconds = max(0, math.ceil(item["remaining"]))
+            line = (
+                f"   {request_id} [{seconds:5d}s left]  "
+                f"{item['peer'][:16]:<16}  ->  {self.name[:16]:<16}  :  "
+                f"{one_line(item['payload'])}"
+            )
             self._add(screen, row, 0, line[: width - 1], curses.A_BOLD)
 
         activity_start = 1 + pending_rows
@@ -256,7 +262,7 @@ class AgentTerminal:
             self.scroll_offset = 0
             return
         if key == curses.KEY_HOME:
-            self.cursor = 0
+            self.scroll_offset = max(0, len(self.lines) - self.page_size)
             return
         if key == curses.KEY_DC:
             if self.cursor < len(self.input):
@@ -321,7 +327,7 @@ class AgentTerminal:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("agent_name")
-    parser.add_argument("--server", default="nats://127.0.0.1:4222")
+    parser.add_argument("--server", default="nats://192.168.0.107:4222")
     parser.add_argument("--prefix", default="agents")
     args = parser.parse_args()
 

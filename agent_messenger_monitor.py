@@ -14,16 +14,22 @@ from nats_transport import NatsTransport
 
 
 class FlowTerminal:
-    def __init__(self, server: str, prefix: str):
+    def __init__(
+        self,
+        server: str,
+        prefix: str,
+        agents: list[str],
+    ):
         self.server = server
         self.prefix = prefix
+        self.agents = frozenset(agents)
         self.events: queue.Queue[bytes] = queue.Queue()
         self.lines: list[str] = []
         self.scroll_offset = 0
         self.page_size = 1
         self.pending: dict[str, tuple[str, str, float, str]] = {}
         self.status = (
-            "LIVE — PgUp/PgDn scroll | End latest | Ctrl-L clear | "
+            "LIVE — PgUp/PgDn scroll | Home/End oldest/newest | Ctrl-L clear | "
             "Ctrl-C or Q quit"
         )
         self.running = True
@@ -65,6 +71,8 @@ class FlowTerminal:
                 self.scroll_offset = max(0, self.scroll_offset - self.page_size)
             elif key == curses.KEY_END:
                 self.scroll_offset = 0
+            elif key == curses.KEY_HOME:
+                self.scroll_offset = max(0, len(self.lines) - self.page_size)
 
     def _drain(self) -> None:
         while True:
@@ -74,6 +82,8 @@ class FlowTerminal:
                 return
             try:
                 envelope = json.loads(data.decode())
+                if not self._matches(envelope):
+                    continue
                 self._update_pending(envelope)
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 payload = one_line(envelope.get("payload", ""))
@@ -93,10 +103,18 @@ class FlowTerminal:
                 )
                 self.status = (
                     f"LIVE — {len(self.lines)} events | PgUp/PgDn scroll | "
-                    "End latest | Ctrl-L clear | Ctrl-C or Q quit"
+                    "Home/End oldest/newest | Ctrl-L clear | Ctrl-C or Q quit"
                 )
             except Exception as error:
                 self.status = "ERROR — " + one_line(error)
+
+    def _matches(self, envelope: dict) -> bool:
+        if not self.agents:
+            return True
+        return (
+            envelope.get("sender") in self.agents
+            or envelope.get("recipient") in self.agents
+        )
 
     def _update_pending(self, envelope: dict) -> None:
         sender = envelope.get("sender")
@@ -139,18 +157,27 @@ class FlowTerminal:
             screen.refresh()
             return
 
-        pending_items = sorted(self.pending.items(), key=lambda item: item[1][:2])
+        pending_items = sorted(
+            self.pending.items(),
+            key=lambda item: (item[1][2], item[1][0], item[1][1], item[0]),
+        )
+        agent_scope = ",".join(sorted(self.agents)) if self.agents else "all"
         header = (
-            f" AGENT MESSENGER MONITOR | {self.prefix} | pending: "
-            f"{len(pending_items) or 'none'} | {self.server} "
+            f" AGENT MESSENGER MONITOR | agents: {agent_scope} | {self.prefix} | "
+            f"pending: {len(pending_items) or 'none'} | {self.server} "
         )
         self._add(screen, 0, 0, header.ljust(width - 1), curses.A_REVERSE)
 
         pending_rows = min(len(pending_items), max(0, height - 4))
-        for row, (request_id, (sender, recipient, _, payload)) in enumerate(
+        now = time.monotonic()
+        for row, (request_id, (sender, recipient, deadline, payload)) in enumerate(
             pending_items[:pending_rows], 1
         ):
-            line = f"   {request_id[:8]}  {recipient} <- {sender}: {payload}"
+            seconds = max(0, math.ceil(deadline - now))
+            line = (
+                f"   {request_id[:8]} [{seconds:5d}s left]  "
+                f"{sender[:16]:<16}  ->  {recipient[:16]:<16}  :  {payload}"
+            )
             self._add(screen, row, 0, line[: width - 1], curses.A_BOLD)
 
         activity_start = 1 + pending_rows
@@ -177,13 +204,20 @@ class FlowTerminal:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="nats://127.0.0.1:4222")
+    parser.add_argument("--server", default="nats://192.168.0.107:4222")
     parser.add_argument("--prefix", default="agents")
+    parser.add_argument(
+        "--agents",
+        nargs="+",
+        default=[],
+        metavar="NAME",
+        help="show only traffic involving these agents",
+    )
     args = parser.parse_args()
 
     terminal = None
     try:
-        terminal = FlowTerminal(args.server, args.prefix)
+        terminal = FlowTerminal(args.server, args.prefix, args.agents)
         terminal.run()
     except KeyboardInterrupt:
         return 0
