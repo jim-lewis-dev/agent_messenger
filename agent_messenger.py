@@ -59,6 +59,13 @@ class _PendingRequest:
     payload: str
 
 
+@dataclass
+class _WaitingDiscovery:
+    done: threading.Event
+    names: set[str]
+    error: AgentMessengerError | None = None
+
+
 def one_line(value: object) -> str:
     return " ".join(str(value).split()) or type(value).__name__
 
@@ -129,7 +136,7 @@ def _request_id(value: object) -> str:
 
 
 class AgentMessenger:
-    """Portable agent send/request/respond behavior over any Transport."""
+    """Portable agent messaging and discovery over any Transport."""
 
     def __init__(
         self,
@@ -152,11 +159,13 @@ class AgentMessenger:
         self._state_lock = threading.Lock()
         self._waiting: dict[str, _WaitingRequest] = {}
         self._pending: dict[str, _PendingRequest] = {}
+        self._discoveries: dict[str, _WaitingDiscovery] = {}
         self._inbox: queue.Queue[bytes | object | None] = queue.Queue()
         self._closed = False
 
         try:
             self.transport.subscribe(self._topic(self.name), self._inbox.put)
+            self.transport.subscribe(self._discovery_topic(), self._inbox.put)
         except BaseException:
             self.transport.close()
             raise
@@ -245,6 +254,42 @@ class AgentMessenger:
 
         return self._completed_response(waiting)
 
+    def discover(self, timeout: float = 0.2) -> tuple[str, ...]:
+        """Return the names of agents that answer within the bounded interval."""
+        timeout = _timeout(timeout)
+        deadline = time.monotonic() + timeout
+        request_id = uuid.uuid4().hex
+        waiting = _WaitingDiscovery(threading.Event(), {self.name})
+
+        with self._state_lock:
+            if self._closed:
+                raise AgentMessengerClosed("agent messenger is closed")
+            self._discoveries[request_id] = waiting
+
+        try:
+            self._publish_topic(
+                self._discovery_topic(),
+                {
+                    "type": "discover",
+                    "sender": self.name,
+                    "request_id": request_id,
+                },
+            )
+        except Exception:
+            with self._state_lock:
+                self._discoveries.pop(request_id, None)
+            raise
+
+        waiting.done.wait(max(0.0, deadline - time.monotonic()))
+
+        with self._state_lock:
+            self._discoveries.pop(request_id, None)
+            names = tuple(sorted(waiting.names))
+
+        if waiting.error is not None:
+            raise waiting.error
+        return names
+
     def respond(self, request_id: str, payload: str) -> None:
         request_id = _request_id(request_id)
         payload = _payload(payload)
@@ -331,6 +376,12 @@ class AgentMessenger:
             self._waiting.clear()
             self._pending.clear()
 
+            for discovery in self._discoveries.values():
+                discovery.error = AgentMessengerClosed("agent messenger is closed")
+                discovery.done.set()
+
+            self._discoveries.clear()
+
         self._inbox.put(None)
 
         worker_error: AgentMessengerError | None = None
@@ -369,6 +420,9 @@ class AgentMessenger:
     def _topic(self, agent: str) -> str:
         return f"{self.prefix}.inbox.{agent}"
 
+    def _discovery_topic(self) -> str:
+        return f"{self.prefix}.discovery"
+
     def _envelope(
         self,
         message_type: str,
@@ -385,9 +439,12 @@ class AgentMessenger:
         }
 
     def _publish(self, envelope: dict) -> None:
+        self._publish_topic(self._topic(envelope["recipient"]), envelope)
+
+    def _publish_topic(self, topic: str, envelope: dict) -> None:
         self._ensure_open()
         data = json.dumps(envelope, separators=(",", ":")).encode()
-        self.transport.publish(self._topic(envelope["recipient"]), data)
+        self.transport.publish(topic, data)
 
     def _run(self) -> None:
         while True:
@@ -444,6 +501,36 @@ class AgentMessenger:
         if not isinstance(envelope, dict):
             raise AgentMessengerError("envelope must be a JSON object")
 
+        message_type = envelope.get("type")
+
+        if message_type == "discover":
+            sender = _name(envelope.get("sender"))
+            request_id = _request_id(envelope.get("request_id"))
+            self._publish_topic(
+                self._topic(sender),
+                {
+                    "type": "discover_response",
+                    "sender": self.name,
+                    "recipient": sender,
+                    "request_id": request_id,
+                },
+            )
+            return
+
+        if message_type == "discover_response":
+            recipient = _name(envelope.get("recipient"))
+            if recipient != self.name:
+                raise AgentMessengerError(
+                    f"envelope recipient {recipient!r} does not match {self.name!r}"
+                )
+            sender = _name(envelope.get("sender"))
+            request_id = _request_id(envelope.get("request_id"))
+            with self._state_lock:
+                waiting = self._discoveries.get(request_id)
+                if waiting is not None:
+                    waiting.names.add(sender)
+            return
+
         recipient = _name(envelope.get("recipient"))
         if recipient != self.name:
             raise AgentMessengerError(
@@ -452,8 +539,6 @@ class AgentMessenger:
 
         sender = _name(envelope.get("sender"))
         payload = _payload(envelope.get("payload"))
-        message_type = envelope.get("type")
-
         if message_type == "message":
             self._emit("in_message", peer=sender, payload=payload)
             return
