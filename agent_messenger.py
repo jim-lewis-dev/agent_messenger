@@ -144,10 +144,14 @@ class AgentMessenger:
         transport: Transport,
         prefix: str = "agents",
         on_event: Callable[[dict], None] | None = None,
+        discovery_groups: tuple[str, ...] = (),
     ):
         self.name = _name(name)
         self.transport = transport
         self.prefix = _prefix(prefix)
+        self.discovery_groups = tuple(
+            dict.fromkeys(_name(group) for group in discovery_groups)
+        )
 
         self._listeners: list[Callable[[dict], None]] = []
         if on_event is not None:
@@ -166,6 +170,11 @@ class AgentMessenger:
         try:
             self.transport.subscribe(self._topic(self.name), self._inbox.put)
             self.transport.subscribe(self._discovery_topic(), self._inbox.put)
+            for group in self.discovery_groups:
+                self.transport.subscribe(
+                    self._discovery_topic(group),
+                    self._inbox.put
+                )
         except BaseException:
             self.transport.close()
             raise
@@ -254,12 +263,23 @@ class AgentMessenger:
 
         return self._completed_response(waiting)
 
-    def discover(self, timeout: float = 0.2) -> tuple[str, ...]:
-        """Return the names of agents that answer within the bounded interval."""
+    def discover(
+        self,
+        timeout: float = 0.2,
+        group: str | None = None
+    ) -> tuple[str, ...]:
+        """Return names that answer the general or selected discovery broadcast."""
         timeout = _timeout(timeout)
+        if group is not None:
+            group = _name(group)
         deadline = time.monotonic() + timeout
         request_id = uuid.uuid4().hex
-        waiting = _WaitingDiscovery(threading.Event(), {self.name})
+        own_name = (
+            {self.name}
+            if group is None or group in self.discovery_groups
+            else set()
+        )
+        waiting = _WaitingDiscovery(threading.Event(), own_name)
 
         with self._state_lock:
             if self._closed:
@@ -268,7 +288,7 @@ class AgentMessenger:
 
         try:
             self._publish_topic(
-                self._discovery_topic(),
+                self._discovery_topic(group),
                 {
                     "type": "discover",
                     "sender": self.name,
@@ -420,8 +440,11 @@ class AgentMessenger:
     def _topic(self, agent: str) -> str:
         return f"{self.prefix}.inbox.{agent}"
 
-    def _discovery_topic(self) -> str:
-        return f"{self.prefix}.discovery"
+    def _discovery_topic(self, group: str | None = None) -> str:
+        topic = f"{self.prefix}.discovery"
+        if group is not None:
+            topic += f".{group}"
+        return topic
 
     def _envelope(
         self,
