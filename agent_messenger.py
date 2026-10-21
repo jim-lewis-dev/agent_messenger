@@ -59,6 +59,12 @@ class _PendingRequest:
     payload: str
 
 
+@dataclass(frozen=True)
+class _ReceivedMessage:
+    data: bytes
+    received_at: float
+
+
 @dataclass
 class _WaitingDiscovery:
     done: threading.Event
@@ -164,16 +170,16 @@ class AgentMessenger:
         self._waiting: dict[str, _WaitingRequest] = {}
         self._pending: dict[str, _PendingRequest] = {}
         self._discoveries: dict[str, _WaitingDiscovery] = {}
-        self._inbox: queue.Queue[bytes | object | None] = queue.Queue()
+        self._inbox: queue.Queue[_ReceivedMessage | object | None] = queue.Queue()
         self._closed = False
 
         try:
-            self.transport.subscribe(self._topic(self.name), self._inbox.put)
-            self.transport.subscribe(self._discovery_topic(), self._inbox.put)
+            self.transport.subscribe(self._topic(self.name), self._enqueue_received)
+            self.transport.subscribe(self._discovery_topic(), self._enqueue_received)
             for group in self.discovery_groups:
                 self.transport.subscribe(
                     self._discovery_topic(group),
-                    self._inbox.put
+                    self._enqueue_received
                 )
         except BaseException:
             self.transport.close()
@@ -228,15 +234,17 @@ class AgentMessenger:
         )
 
         try:
-            self._publish(
-                self._envelope(
-                    "request",
-                    recipient,
-                    payload,
-                    request_id=request_id,
-                    timeout=timeout,
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._publish(
+                    self._envelope(
+                        "request",
+                        recipient,
+                        payload,
+                        request_id=request_id,
+                        timeout=remaining,
+                    )
                 )
-            )
         except Exception:
             with self._state_lock:
                 self._waiting.pop(request_id, None)
@@ -469,6 +477,10 @@ class AgentMessenger:
         data = json.dumps(envelope, separators=(",", ":")).encode()
         self.transport.publish(topic, data)
 
+    def _enqueue_received(self, data: bytes) -> None:
+        # Timestamp before the messenger's own worker queue can delay delivery.
+        self._inbox.put(_ReceivedMessage(data, time.monotonic()))
+
     def _run(self) -> None:
         while True:
             self._expire_pending()
@@ -489,8 +501,8 @@ class AgentMessenger:
                     continue
 
             try:
-                envelope = json.loads(data.decode())
-                self._receive(envelope)
+                envelope = json.loads(data.data.decode())
+                self._receive(envelope, data.received_at)
             except Exception as error:
                 self._emit("protocol_error", payload=one_line(error))
 
@@ -520,7 +532,7 @@ class AgentMessenger:
                 request_id=request_id,
             )
 
-    def _receive(self, envelope: object) -> None:
+    def _receive(self, envelope: object, received_at: float) -> None:
         if not isinstance(envelope, dict):
             raise AgentMessengerError("envelope must be a JSON object")
 
@@ -571,9 +583,12 @@ class AgentMessenger:
             timeout = _timeout(envelope.get("timeout"))
             pending = _PendingRequest(
                 sender=sender,
-                deadline=time.monotonic() + timeout,
+                deadline=received_at + timeout,
                 payload=payload,
             )
+            if time.monotonic() >= pending.deadline:
+                self._emit("expired_request", peer=sender, payload=payload, request_id=request_id)
+                return
 
             with self._state_lock:
                 if self._closed:
@@ -587,6 +602,7 @@ class AgentMessenger:
                 peer=sender,
                 payload=payload,
                 timeout=timeout,
+                deadline=pending.deadline,
                 request_id=request_id,
             )
             return
