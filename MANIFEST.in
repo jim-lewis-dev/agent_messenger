@@ -1,0 +1,5 @@
+include LICENSE README.md
+recursive-include examples *.py *.md
+recursive-include tests *.py
+include .github/workflows/test.yml
+recursive-include docs *.md *.png

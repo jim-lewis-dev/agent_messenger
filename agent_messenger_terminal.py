@@ -2,11 +2,14 @@
 """Full-screen interactive terminal for Agent Messenger."""
 
 import argparse
+from contextlib import suppress
 import curses
 import math
 import queue
+import sys
 import threading
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 from agent_messenger import (
     AgentMessenger,
@@ -38,18 +41,26 @@ class AgentTerminal:
             "Ctrl-L clear | Ctrl-C quit"
         )
         self.running = True
+        address = urlsplit(server)
+        self.server_label = urlunsplit(address._replace(netloc=address.netloc.rsplit("@", 1)[-1]))
         self.transport = NatsTransport(server)
-        self.agent = AgentMessenger(
-            name,
-            self.transport,
-            prefix=prefix,
-            on_event=self.post,
-        )
+        try:
+            self.agent = AgentMessenger(
+                name,
+                self.transport,
+                prefix=prefix,
+                on_event=self.post,
+            )
+        except BaseException:
+            with suppress(BaseException):
+                self.transport.close()
+            raise
         self.namespace = {
             "send": self.agent.send,
             "request": self.agent.request,
             "respond": self.respond,
             "pending": self.pending,
+            "discover": self.agent.discover,
         }
 
     def post(self, event: dict) -> None:
@@ -141,7 +152,7 @@ class AgentTerminal:
             payload = f"[{request_id[:8]}] {payload}"
 
         if event_type == "ready":
-            return f"{timestamp}  READY     {self.name} @ {self.server}"
+            return f"{timestamp}  READY     {self.name} @ {self.server_label}"
 
         traffic = {
             "out_message": ("MESSAGE", self.name, peer),
@@ -324,26 +335,34 @@ class AgentTerminal:
             self.post({"type": "error", "payload": one_line(error)})
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Enter Python expressions using send(), request(), respond(), pending(), or discover().",
+    )
     parser.add_argument("agent_name")
-    parser.add_argument("--server", default="nats://192.168.0.107:4222")
+    parser.add_argument("--server", default="nats://127.0.0.1:4222")
     parser.add_argument("--prefix", default="agents")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     terminal = None
+    result = 0
     try:
         terminal = AgentTerminal(args.agent_name, args.server, args.prefix)
         terminal.run()
     except KeyboardInterrupt:
-        return 0
+        pass
     except Exception as error:
-        print(f"ERROR — {one_line(error)}")
-        return 1
+        print(f"ERROR — {one_line(error)}", file=sys.stderr)
+        result = 1
     finally:
         if terminal is not None:
-            terminal.close()
-    return 0
+            try:
+                terminal.close()
+            except Exception as error:
+                print(f"ERROR — {one_line(error)}", file=sys.stderr)
+                result = 1
+    return result
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ class RequestExpired(AgentMessengerError):
 
 class Transport(Protocol):
     def subscribe(self, topic: str, callback: Callable[[bytes], None]) -> None: ...
-    def publish(self, topic: str, data: bytes) -> None: ...
+    def publish(self, topic: str, data: bytes, *, timeout: float | None = None) -> None: ...
     def close(self) -> None: ...
 
 
@@ -48,6 +48,7 @@ class Transport(Protocol):
 class _WaitingRequest:
     recipient: str
     done: threading.Event
+    deadline: float
     response: str | None = None
     error: AgentMessengerError | None = None
 
@@ -181,8 +182,13 @@ class AgentMessenger:
                     self._discovery_topic(group),
                     self._enqueue_received
                 )
-        except BaseException:
-            self.transport.close()
+        except BaseException as error:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+            if isinstance(error, Exception):
+                raise AgentMessengerError(f"transport subscribe failed: {one_line(error)}") from error
             raise
 
         self._worker = threading.Thread(
@@ -218,7 +224,7 @@ class AgentMessenger:
 
         deadline = time.monotonic() + timeout
         request_id = uuid.uuid4().hex
-        waiting = _WaitingRequest(recipient, threading.Event())
+        waiting = _WaitingRequest(recipient, threading.Event(), deadline)
 
         with self._state_lock:
             if self._closed:
@@ -243,11 +249,18 @@ class AgentMessenger:
                         payload,
                         request_id=request_id,
                         timeout=remaining,
-                    )
+                    ),
+                    timeout=remaining,
                 )
-        except Exception:
+        except Exception as error:
             with self._state_lock:
                 self._waiting.pop(request_id, None)
+            if time.monotonic() >= deadline:
+                self._emit("request_timeout", peer=recipient, payload=payload,
+                           timeout=timeout, request_id=request_id)
+                raise RequestTimeout(
+                    f"{recipient!r} did not respond within {timeout:g}s"
+                ) from error
             raise
 
         remaining = max(0.0, deadline - time.monotonic())
@@ -295,14 +308,17 @@ class AgentMessenger:
             self._discoveries[request_id] = waiting
 
         try:
-            self._publish_topic(
-                self._discovery_topic(group),
-                {
-                    "type": "discover",
-                    "sender": self.name,
-                    "request_id": request_id,
-                },
-            )
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._publish_topic(
+                    self._discovery_topic(group),
+                    {
+                        "type": "discover",
+                        "sender": self.name,
+                        "request_id": request_id,
+                    },
+                    timeout=remaining,
+                )
         except Exception:
             with self._state_lock:
                 self._discoveries.pop(request_id, None)
@@ -345,15 +361,21 @@ class AgentMessenger:
         )
 
         try:
+            remaining = pending.deadline - time.monotonic()
+            if remaining <= 0:
+                raise RequestExpired(
+                    f"request {request_id[:8]!r} from {pending.sender!r} has expired"
+                )
             self._publish(
                 self._envelope(
                     "response",
                     pending.sender,
                     payload,
                     request_id=request_id,
-                )
+                ),
+                timeout=remaining,
             )
-        except Exception:
+        except Exception as error:
             with self._state_lock:
                 if (
                     not self._closed
@@ -362,6 +384,10 @@ class AgentMessenger:
                 ):
                     self._pending[request_id] = pending
                     self._inbox.put(_WAKE)
+            if time.monotonic() >= pending.deadline:
+                raise RequestExpired(
+                    f"request {request_id[:8]!r} from {pending.sender!r} has expired"
+                ) from error
             raise
 
     def pending(self) -> tuple[dict, ...]:
@@ -422,10 +448,10 @@ class AgentMessenger:
 
         try:
             self.transport.close()
-        except Exception:
+        except Exception as error:
             if worker_error is not None:
-                raise worker_error
-            raise
+                raise worker_error from error
+            raise AgentMessengerError(f"transport close failed: {one_line(error)}") from error
 
         if worker_error is not None:
             raise worker_error
@@ -469,13 +495,19 @@ class AgentMessenger:
             **extra,
         }
 
-    def _publish(self, envelope: dict) -> None:
-        self._publish_topic(self._topic(envelope["recipient"]), envelope)
+    def _publish(self, envelope: dict, *, timeout: float | None = None) -> None:
+        self._publish_topic(self._topic(envelope["recipient"]), envelope, timeout=timeout)
 
-    def _publish_topic(self, topic: str, envelope: dict) -> None:
+    def _publish_topic(self, topic: str, envelope: dict, *, timeout: float | None = None) -> None:
         self._ensure_open()
         data = json.dumps(envelope, separators=(",", ":")).encode()
-        self.transport.publish(topic, data)
+        try:
+            if timeout is None:
+                self.transport.publish(topic, data)
+            else:
+                self.transport.publish(topic, data, timeout=timeout)
+        except Exception as error:
+            raise AgentMessengerError(f"transport publish failed: {one_line(error)}") from error
 
     def _enqueue_received(self, data: bytes) -> None:
         # Timestamp before the messenger's own worker queue can delay delivery.
@@ -613,7 +645,7 @@ class AgentMessenger:
             with self._state_lock:
                 waiting = self._waiting.get(request_id)
 
-                if waiting is None:
+                if waiting is None or received_at >= waiting.deadline:
                     late = True
                     wrong_sender = False
                 elif sender != waiting.recipient:
