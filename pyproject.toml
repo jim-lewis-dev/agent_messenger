@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-messenger"
+version = "0.1.0"
+description = "Named live messaging, request/reply, discovery, and terminal tools over Core NATS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Jim Lewis"}]
+dependencies = ["nats-transport-wrapper @ git+https://github.com/jim-lewis-dev/nats_transport.git@80a89da0aa67695d8f0d0d1a63d4fbb20574b960"]
+
+[project.urls]
+Homepage = "https://github.com/jim-lewis-dev/agent_messenger"
+Repository = "https://github.com/jim-lewis-dev/agent_messenger"
+Issues = "https://github.com/jim-lewis-dev/agent_messenger/issues"
+
+[project.scripts]
+agent-messenger-terminal = "agent_messenger_terminal:main"
+agent-messenger-monitor = "agent_messenger_monitor:main"
+
+[tool.setuptools]
+py-modules = ["agent_messenger", "agent_messenger_terminal", "agent_messenger_monitor"]

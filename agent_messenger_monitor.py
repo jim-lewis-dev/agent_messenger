@@ -2,12 +2,15 @@
 """Full-screen system-wide Agent Messenger traffic monitor."""
 
 import argparse
+from contextlib import suppress
 import curses
 import json
 import math
 import queue
+import sys
 import time
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 from agent_messenger import format_message_line, one_line
 from nats_transport import NatsTransport
@@ -23,7 +26,7 @@ class FlowTerminal:
         self.server = server
         self.prefix = prefix
         self.agents = frozenset(agents)
-        self.events: queue.Queue[bytes] = queue.Queue()
+        self.events: queue.Queue[tuple[bytes, float]] = queue.Queue()
         self.lines: list[str] = []
         self.scroll_offset = 0
         self.page_size = 1
@@ -33,8 +36,18 @@ class FlowTerminal:
             "Ctrl-C or Q quit"
         )
         self.running = True
+        address = urlsplit(server)
+        self.server_label = urlunsplit(address._replace(netloc=address.netloc.rsplit("@", 1)[-1]))
         self.transport = NatsTransport(server)
-        self.transport.subscribe(f"{prefix}.inbox.*", self.events.put)
+        try:
+            self.transport.subscribe(f"{prefix}.inbox.*", self._enqueue)
+        except BaseException:
+            with suppress(BaseException):
+                self.transport.close()
+            raise
+
+    def _enqueue(self, data: bytes) -> None:
+        self.events.put((data, time.monotonic()))
 
     def close(self) -> None:
         self.transport.close()
@@ -77,14 +90,14 @@ class FlowTerminal:
     def _drain(self) -> None:
         while True:
             try:
-                data = self.events.get_nowait()
+                data, received_at = self.events.get_nowait()
             except queue.Empty:
                 return
             try:
                 envelope = json.loads(data.decode())
                 if not self._matches(envelope):
                     continue
-                self._update_pending(envelope)
+                self._update_pending(envelope, received_at)
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 payload = one_line(envelope.get("payload", ""))
                 request_id = envelope.get("request_id")
@@ -116,7 +129,7 @@ class FlowTerminal:
             or envelope.get("recipient") in self.agents
         )
 
-    def _update_pending(self, envelope: dict) -> None:
+    def _update_pending(self, envelope: dict, received_at: float) -> None:
         sender = envelope.get("sender")
         recipient = envelope.get("recipient")
         message_type = envelope.get("type")
@@ -135,7 +148,7 @@ class FlowTerminal:
                 self.pending[request_id] = (
                     sender,
                     recipient,
-                    time.monotonic() + float(timeout),
+                    received_at + float(timeout),
                     one_line(envelope.get("payload", "")),
                 )
         elif message_type == "response":
@@ -164,7 +177,7 @@ class FlowTerminal:
         agent_scope = ",".join(sorted(self.agents)) if self.agents else "all"
         header = (
             f" AGENT MESSENGER MONITOR | agents: {agent_scope} | {self.prefix} | "
-            f"pending: {len(pending_items) or 'none'} | {self.server} "
+            f"pending: {len(pending_items) or 'none'} | {self.server_label} "
         )
         self._add(screen, 0, 0, header.ljust(width - 1), curses.A_REVERSE)
 
@@ -202,9 +215,9 @@ class FlowTerminal:
             pass
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="nats://192.168.0.107:4222")
+    parser.add_argument("--server", default="nats://127.0.0.1:4222")
     parser.add_argument("--prefix", default="agents")
     parser.add_argument(
         "--agents",
@@ -213,21 +226,26 @@ def main() -> int:
         metavar="NAME",
         help="show only traffic involving these agents",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     terminal = None
+    result = 0
     try:
         terminal = FlowTerminal(args.server, args.prefix, args.agents)
         terminal.run()
     except KeyboardInterrupt:
-        return 0
+        pass
     except Exception as error:
-        print(f"ERROR — {one_line(error)}")
-        return 1
+        print(f"ERROR — {one_line(error)}", file=sys.stderr)
+        result = 1
     finally:
         if terminal is not None:
-            terminal.close()
-    return 0
+            try:
+                terminal.close()
+            except Exception as error:
+                print(f"ERROR — {one_line(error)}", file=sys.stderr)
+                result = 1
+    return result
 
 
 if __name__ == "__main__":
